@@ -33,13 +33,17 @@ class NukeProjectSettingsHandler:
     nuke.root() automatically.
 
     Data source priority:
-    1. Env vars staged by hooks/tk-multi-launchapp/before_app_launch.py
-       (NFA_PROJECT_FPS, NFA_SHOT_CUT_IN, NFA_SHOT_CUT_OUT). These are
-       already resolved once at launch time, so this is the cheap path
-       and avoids a second ShotGrid round trip on every script load.
-    2. If the env vars are missing (e.g. artist attached to an already
-       running Nuke session, or launched outside the ShotGrid launcher),
-       fall back to a live ShotGrid query using the current context.
+    1. A live ShotGrid query against the current context. This is the
+       source of truth - it's what makes the values correct even after
+       an in-session context switch (tk-multi-workfiles2 can change
+       context without restarting the engine), which env vars staged
+       once at process launch cannot reflect.
+    2. If the live query fails (e.g. transient ShotGrid connectivity
+       issue), fall back to the env vars staged by
+       hooks/tk-multi-launchapp/before_app_launch.py (NFA_PROJECT_FPS,
+       NFA_SHOT_CUT_IN, NFA_SHOT_CUT_OUT). These only reflect the
+       context at launch time, so they are a degraded fallback, not
+       the primary source.
 
     Only applies values when the current context is a Shot - on Project
     or other entity contexts this is a no-op, matching how
@@ -50,24 +54,62 @@ class NukeProjectSettingsHandler:
         self.app = sgtk.platform.current_bundle()
 
     def _get_fps(self, context):
+        project = context.project
+        if project:
+            try:
+                sg = self.app.shotgun
+                result = sg.find_one(
+                    "Project", [["id", "is", project["id"]]], ["sg_fps"]
+                )
+                if result and result.get("sg_fps") is not None:
+                    return float(result["sg_fps"])
+                return None
+            except Exception:
+                logger.warning(
+                    "tk-nuke-projectsettings: live sg_fps query failed, "
+                    "falling back to NFA_PROJECT_FPS env var",
+                    exc_info=True,
+                )
+
+        # Fallback: env var staged at launch time (may be stale after an
+        # in-session context switch, or absent if ShotGrid was reachable
+        # but the project has no sg_fps set - only used if the query
+        # above didn't run or raised).
         env_fps = os.environ.get("NFA_PROJECT_FPS")
         if env_fps:
             try:
                 return float(env_fps)
             except ValueError:
                 logger.warning("NFA_PROJECT_FPS env var is not numeric: %s", env_fps)
-
-        # Fallback: live query
-        project = context.project
-        if not project:
-            return None
-        sg = self.app.shotgun
-        result = sg.find_one("Project", [["id", "is", project["id"]]], ["sg_fps"])
-        if result and result.get("sg_fps") is not None:
-            return float(result["sg_fps"])
         return None
 
     def _get_frame_range(self, context):
+        entity = context.entity
+        if entity and entity.get("type") == "Shot":
+            try:
+                sg = self.app.shotgun
+                result = sg.find_one(
+                    "Shot",
+                    [["id", "is", entity["id"]]],
+                    ["sg_cut_in", "sg_cut_out"],
+                )
+                if (
+                    result
+                    and result.get("sg_cut_in") is not None
+                    and result.get("sg_cut_out") is not None
+                ):
+                    return int(result["sg_cut_in"]), int(result["sg_cut_out"])
+                return None, None
+            except Exception:
+                logger.warning(
+                    "tk-nuke-projectsettings: live sg_cut_in/out query failed, "
+                    "falling back to NFA_SHOT_CUT_IN/OUT env vars",
+                    exc_info=True,
+                )
+
+        # Fallback: env vars staged at launch time (may be stale after an
+        # in-session context switch - only used if the query above didn't
+        # run because context.entity isn't a Shot, or raised).
         env_in = os.environ.get("NFA_SHOT_CUT_IN")
         env_out = os.environ.get("NFA_SHOT_CUT_OUT")
         if env_in and env_out:
@@ -79,17 +121,6 @@ class NukeProjectSettingsHandler:
                     env_in,
                     env_out,
                 )
-
-        # Fallback: live query, only meaningful for a Shot context
-        entity = context.entity
-        if not entity or entity.get("type") != "Shot":
-            return None, None
-        sg = self.app.shotgun
-        result = sg.find_one(
-            "Shot", [["id", "is", entity["id"]]], ["sg_cut_in", "sg_cut_out"]
-        )
-        if result and result.get("sg_cut_in") is not None and result.get("sg_cut_out") is not None:
-            return int(result["sg_cut_in"]), int(result["sg_cut_out"])
         return None, None
 
     def apply_settings(self):
@@ -98,7 +129,13 @@ class NukeProjectSettingsHandler:
         creation and on script load, so both a fresh session and an
         opened .nk pick up current ShotGrid values.
         """
-        context = self.app.context
+        # Read the context fresh from the current engine rather than
+        # self.app.context - the latter is captured once when the app
+        # bundle is constructed and is not guaranteed to reflect a later
+        # in-session context switch (e.g. tk-multi-workfiles2 changing
+        # context without a full engine restart).
+        engine = sgtk.platform.current_engine()
+        context = engine.context
 
         # Only act on Shot-scoped contexts - matches where this app is
         # registered (settings.tk-nuke.shot_step), but guards against
