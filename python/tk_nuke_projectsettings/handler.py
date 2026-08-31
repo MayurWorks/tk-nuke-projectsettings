@@ -21,18 +21,31 @@
 # SOFTWARE.
 
 import os
+import re
+import glob
 import sgtk
 import nuke
 
 logger = sgtk.platform.get_logger(__name__)
 
+# Nuke 14+ ships ACES 1.2 as a built-in OCIO config choice - no config file
+# on disk is needed, just these two root() knob values.
+OCIO_COLOR_MANAGEMENT = "OCIO"
+OCIO_CONFIG_NAME = "aces_1.2"
+
+# PublishedFile.published_file_type name registered by tk-hiero-export for
+# the copied/ingested plate sequence (template_copy_path: hiero_copy_path
+# in env/includes/settings/tk-hiero-export.yml). Adjust if the studio's
+# hiero-export config names this publish type differently.
+PLATE_PUBLISH_TYPES = ["Rendered Image", "Image"]
+
 
 class NukeProjectSettingsHandler:
     """
-    Applies ShotGrid project/shot settings (fps, frame range, format) to
-    nuke.root() automatically.
+    Applies ShotGrid project/shot settings (fps, frame range, OCIO, and the
+    ingested plate as a Read node) to the current Nuke script automatically.
 
-    Data source priority:
+    Data source priority for fps / frame range:
     1. A live ShotGrid query against the current context. This is the
        source of truth - it's what makes the values correct even after
        an in-session context switch (tk-multi-workfiles2 can change
@@ -44,6 +57,12 @@ class NukeProjectSettingsHandler:
        NFA_SHOT_CUT_IN, NFA_SHOT_CUT_OUT). These only reflect the
        context at launch time, so they are a degraded fallback, not
        the primary source.
+    3. For frame range specifically, if the Shot has no sg_cut_in/
+       sg_cut_out set at all (neither live nor via env var), fall back
+       further to scanning the actual ingested EXR sequence on disk
+       (the hiero_copy_path/hiero_render_path plate location) for its
+       real first/last frame. This covers shots ingested before cut
+       fields were populated in ShotGrid.
 
     Only applies values when the current context is a Shot - on Project
     or other entity contexts this is a no-op, matching how
@@ -123,6 +142,185 @@ class NukeProjectSettingsHandler:
                 )
         return None, None
 
+    def _find_latest_plate_publish(self, context):
+        """
+        Looks up the most recent PublishedFile for this Shot matching the
+        ingested-plate publish types (see PLATE_PUBLISH_TYPES). Returns the
+        PublishedFile dict (with path_cache resolved to an absolute path)
+        or None if nothing is published yet.
+        """
+        entity = context.entity
+        if not entity or entity.get("type") != "Shot":
+            return None
+
+        try:
+            sg = self.app.shotgun
+            filters = [
+                ["entity", "is", entity],
+                ["published_file_type.PublishedFileType.code", "in", PLATE_PUBLISH_TYPES],
+            ]
+            fields = ["path", "path_cache", "version_number", "created_at", "code"]
+            order = [{"field_name": "version_number", "direction": "desc"}]
+            result = sg.find_one(
+                "PublishedFile", filters, fields, order=order
+            )
+            return result
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: PublishedFile lookup for plate failed",
+                exc_info=True,
+            )
+            return None
+
+    def _resolve_plate_sequence_path(self, context, publish=None):
+        """
+        Resolves the on-disk EXR sequence path for the current shot's
+        ingested plate, as a Nuke-style %04d printf path suitable for a
+        Read node. Prefers the resolved PublishedFile path when given;
+        otherwise falls back to applying the hiero_copy_path template
+        directly from context (covers the case where ingestion happened
+        but PublishedFile registration hasn't run/succeeded yet).
+
+        Returns (printf_path, first_frame, last_frame) or (None, None, None)
+        if no sequence could be found on disk.
+        """
+        tk = self.app.sgtk
+        seq_dir = None
+
+        if publish and publish.get("path"):
+            local_path = publish["path"].get("local_path")
+            if local_path:
+                seq_dir = os.path.dirname(local_path)
+
+        if seq_dir is None:
+            try:
+                copy_template = tk.templates.get("hiero_copy_path")
+                if copy_template is not None:
+                    fields = context.as_template_fields(copy_template)
+                    # fileext isn't resolvable from context alone; assume exr,
+                    # the standard ingest format for this pipeline.
+                    fields.setdefault("fileext", "exr")
+                    fields["SEQ"] = 1  # placeholder int, only used for dirname
+                    resolved_path = copy_template.apply_fields(fields)
+                    seq_dir = os.path.dirname(resolved_path)
+            except Exception:
+                logger.warning(
+                    "tk-nuke-projectsettings: could not resolve "
+                    "hiero_copy_path template for plate scan",
+                    exc_info=True,
+                )
+                return None, None, None
+
+        if not seq_dir or not os.path.isdir(seq_dir):
+            return None, None, None
+
+        # Any .exr in the resolved shot-plate directory is treated as part
+        # of the ingested sequence.
+        frame_files = sorted(glob.glob(os.path.join(seq_dir, "*.exr")))
+
+        if not frame_files:
+            return None, None, None
+
+        frame_numbers = []
+        frame_re = re.compile(r"\.(\d+)\.exr$", re.IGNORECASE)
+        for f in frame_files:
+            m = frame_re.search(f)
+            if m:
+                frame_numbers.append(int(m.group(1)))
+
+        if not frame_numbers:
+            return None, None, None
+
+        first_frame = min(frame_numbers)
+        last_frame = max(frame_numbers)
+
+        # Build a Nuke-style printf path from the first matched file,
+        # replacing its frame-number run with the correct %0Nd padding.
+        sample = frame_files[0]
+        m = frame_re.search(sample)
+        padding = len(m.group(1))
+        printf_path = frame_re.sub(".%%0%dd.exr" % padding, sample)
+
+        return printf_path, first_frame, last_frame
+
+    def _apply_ocio(self, root):
+        """
+        Sets Nuke's built-in ACES 1.2 OCIO config via Project Settings
+        knobs. This is the same as an artist manually setting Color
+        Management: OCIO and OCIO Config: aces_1.2 in the dropdown -
+        no external .ocio file is used, Nuke 14+ ships this config
+        internally.
+        """
+        try:
+            if root["colorManagement"].value() != OCIO_COLOR_MANAGEMENT:
+                root["colorManagement"].setValue(OCIO_COLOR_MANAGEMENT)
+            if root["OCIO_config"].value() != OCIO_CONFIG_NAME:
+                root["OCIO_config"].setValue(OCIO_CONFIG_NAME)
+            logger.info(
+                "tk-nuke-projectsettings: set color management to OCIO / %s",
+                OCIO_CONFIG_NAME,
+            )
+        except (KeyError, ValueError):
+            # KeyError: knob name not present on this root() (older/newer
+            # Nuke version with different knob names). ValueError: this
+            # Nuke build's OCIO_config dropdown doesn't include aces_1.2.
+            # Either way, log and move on rather than breaking script
+            # creation over a settings knob.
+            logger.warning(
+                "tk-nuke-projectsettings: could not set colorManagement/"
+                "OCIO_config to OCIO/aces_1.2 - check Nuke version",
+                exc_info=True,
+            )
+
+    def _create_or_update_plate_read(self, context, printf_path, first_frame, last_frame):
+        """
+        Creates a Read node for the ingested plate sequence if one doesn't
+        already exist for this shot (identified by node name
+        "plate_<Shot>"). On later script loads, only refreshes an existing
+        node's path/range if it's still pointed at the same plate
+        directory this handler set it to - if an artist has repathed it
+        (e.g. to a newer manual version, or somewhere else entirely) their
+        edit is left alone rather than silently overwritten.
+        """
+        if not printf_path:
+            return
+
+        node_name = "plate_%s" % context.entity["name"]
+        existing = nuke.toNode(node_name)
+        target_dir = os.path.dirname(printf_path.replace(os.sep, "/"))
+
+        if existing is not None and existing.Class() == "Read":
+            current_dir = os.path.dirname(
+                existing["file"].value().replace(os.sep, "/")
+            )
+            if current_dir != target_dir:
+                logger.info(
+                    "tk-nuke-projectsettings: Read node '%s' already "
+                    "points elsewhere (%s), leaving it as-is",
+                    node_name,
+                    current_dir,
+                )
+                return
+            read_node = existing
+        else:
+            read_node = nuke.createNode("Read", inpanel=False)
+            read_node.setName(node_name)
+
+        read_node["file"].setValue(printf_path.replace(os.sep, "/"))
+        if first_frame is not None and last_frame is not None:
+            read_node["first"].setValue(first_frame)
+            read_node["last"].setValue(last_frame)
+            read_node["origfirst"].setValue(first_frame)
+            read_node["origlast"].setValue(last_frame)
+
+        logger.info(
+            "tk-nuke-projectsettings: set Read node '%s' to %s (%s-%s)",
+            node_name,
+            printf_path,
+            first_frame,
+            last_frame,
+        )
+
     def apply_settings(self):
         """
         Applies fps and frame range to nuke.root(). Called on new-file
@@ -148,6 +346,10 @@ class NukeProjectSettingsHandler:
 
         root = nuke.root()
 
+        # --- Color management: ACES 1.2 via Nuke's built-in OCIO config ---
+        self._apply_ocio(root)
+
+        # --- FPS ---
         fps = self._get_fps(context)
         if fps is not None:
             if root["fps"].value() != fps:
@@ -158,7 +360,22 @@ class NukeProjectSettingsHandler:
                 "tk-nuke-projectsettings: no sg_fps found, leaving fps untouched"
             )
 
+        # --- Plate lookup (used for both the Read node and, if needed,
+        # as the disk-scan fallback source for frame range) ---
+        publish = self._find_latest_plate_publish(context)
+        printf_path, disk_first, disk_last = self._resolve_plate_sequence_path(
+            context, publish=publish
+        )
+
+        # --- Frame range: ShotGrid cut_in/cut_out first, ingested-plate
+        # disk scan as fallback when SG has no cut fields set ---
         first_frame, last_frame = self._get_frame_range(context)
+        source = "sg_cut_in/sg_cut_out"
+        if first_frame is None or last_frame is None:
+            if disk_first is not None and disk_last is not None:
+                first_frame, last_frame = disk_first, disk_last
+                source = "ingested plate sequence on disk"
+
         if first_frame is not None and last_frame is not None:
             if (
                 root["first_frame"].value() != first_frame
@@ -167,14 +384,26 @@ class NukeProjectSettingsHandler:
                 root["first_frame"].setValue(first_frame)
                 root["last_frame"].setValue(last_frame)
                 logger.info(
-                    "tk-nuke-projectsettings: set frame range to %s-%s",
+                    "tk-nuke-projectsettings: set frame range to %s-%s (source: %s)",
                     first_frame,
                     last_frame,
+                    source,
                 )
         else:
             logger.info(
-                "tk-nuke-projectsettings: no sg_cut_in/sg_cut_out found, "
-                "leaving frame range untouched"
+                "tk-nuke-projectsettings: no sg_cut_in/sg_cut_out and no "
+                "ingested plate found on disk, leaving frame range untouched"
+            )
+
+        # --- Auto-pickup: Read node from the ingested plate sequence ---
+        if printf_path:
+            self._create_or_update_plate_read(
+                context, printf_path, disk_first, disk_last
+            )
+        else:
+            logger.info(
+                "tk-nuke-projectsettings: no ingested plate found for this "
+                "shot yet, skipping Read node creation"
             )
 
     def add_callbacks(self):

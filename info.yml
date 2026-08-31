@@ -36,10 +36,15 @@ requires_shotgun_fields:
 # More verbose description of this item
 display_name: "Nuke Project Settings"
 description: >
-  Applies ShotGrid Project fps and Shot cut-in/cut-out frame range to
-  nuke.root() automatically on new-file creation and script load, reading
-  values staged by before_app_launch.py (NFA_PROJECT_FPS,
-  NFA_SHOT_CUT_IN/OUT) with a live ShotGrid fallback.
+  Applies ShotGrid Project fps and Shot cut-in/cut-out frame range, ACES
+  1.2 OCIO color management, and an auto-created Read node for the shot's
+  ingested plate sequence to nuke.root() automatically on new-file
+  creation and script load. fps/frame range read values staged by
+  before_app_launch.py (NFA_PROJECT_FPS, NFA_SHOT_CUT_IN/OUT) as a
+  fallback to a live ShotGrid query; frame range further falls back to
+  scanning the ingested EXR sequence on disk if ShotGrid has no cut
+  fields set. The plate Read node is resolved from the latest
+  PublishedFile registered by tk-hiero-export (hiero_copy_path).
 
 requires_shotgun_version:
 requires_core_version: "v0.19.8"
