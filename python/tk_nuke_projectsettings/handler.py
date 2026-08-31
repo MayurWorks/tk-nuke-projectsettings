@@ -34,10 +34,20 @@ OCIO_COLOR_MANAGEMENT = "OCIO"
 OCIO_CONFIG_NAME = "aces_1.2"
 
 # PublishedFile.published_file_type name registered by tk-hiero-export for
-# the copied/ingested plate sequence (template_copy_path: hiero_copy_path
-# in env/includes/settings/tk-hiero-export.yml). Adjust if the studio's
-# hiero-export config names this publish type differently.
-PLATE_PUBLISH_TYPES = ["Rendered Image", "Image"]
+# the copied/ingested plate sequence. On this site only two
+# PublishedFileTypes exist at all: "Nuke Script" and "Hiero Plate" -
+# and "Hiero Plate" is currently only ever used for the reference .mov
+# (hiero_plate_path), never the .exr copy/render sequence
+# (hiero_copy_path/hiero_render_path) - confirmed via a site-wide query
+# turning up zero .exr PublishedFile entries. This is left set to
+# "Hiero Plate" so the PublishedFile lookup starts working the moment
+# that registration gap in tk-hiero-export's config is fixed, but until
+# then _find_latest_plate_publish() will always return None and
+# _resolve_plate_sequence_path()'s directory-scan fallback (which does
+# NOT require a PublishedFile to exist) is what actually finds the
+# plate. See _resolve_plate_sequence_path's docstring for the disk-scan
+# path.
+PLATE_PUBLISH_TYPES = ["Hiero Plate"]
 
 
 class NukeProjectSettingsHandler:
@@ -145,9 +155,13 @@ class NukeProjectSettingsHandler:
     def _find_latest_plate_publish(self, context):
         """
         Looks up the most recent PublishedFile for this Shot matching the
-        ingested-plate publish types (see PLATE_PUBLISH_TYPES). Returns the
-        PublishedFile dict (with path_cache resolved to an absolute path)
-        or None if nothing is published yet.
+        ingested-plate publish types (see PLATE_PUBLISH_TYPES) whose path
+        is an .exr - guards against "Hiero Plate" also covering the
+        reference .mov (hiero_plate_path), which is registered today but
+        is not the frame sequence a Read node should point at. Returns
+        the PublishedFile dict, or None if nothing matching is published
+        yet (which, as of this site's current tk-hiero-export config, is
+        always - see PLATE_PUBLISH_TYPES comment).
         """
         entity = context.entity
         if not entity or entity.get("type") != "Shot":
@@ -161,13 +175,86 @@ class NukeProjectSettingsHandler:
             ]
             fields = ["path", "path_cache", "version_number", "created_at", "code"]
             order = [{"field_name": "version_number", "direction": "desc"}]
-            result = sg.find_one(
+            results = sg.find(
                 "PublishedFile", filters, fields, order=order
             )
-            return result
+            for result in results:
+                path = result.get("path")
+                local_path = path.get("local_path") if path else None
+                if local_path and local_path.lower().endswith(".exr"):
+                    return result
+            return None
         except Exception:
             logger.warning(
                 "tk-nuke-projectsettings: PublishedFile lookup for plate failed",
+                exc_info=True,
+            )
+            return None
+
+    def _find_plate_root_dir(self, context):
+        """
+        Resolves the shot's plate root directory - the "Projects/Plates/
+        {Sequence}/{Shot}" folder that contains one p<version> subfolder
+        per Hiero ingest/re-ingest (p001, p002, ...) - without needing to
+        know the plate version number in advance.
+
+        Built directly from the primary storage root plus the resolved
+        {Sequence}/{Shot} context fields, mirroring how common.yml composes
+        shot_root/asset_root (Artists/{Sequence}/{Shot}/{Step}) and
+        tk-nuke.yml's shot_plate (Projects/Plates/{Sequence}/{Shot}/...) -
+        rather than walking up from a Nuke work-area path by directory-
+        level count, which is brittle against template changes (e.g.
+        shot_work_area_nuke resolves 6 levels deep:
+        Artists/{Sequence}/{Shot}/{Step}/Nuke/{Step}).
+
+        shot_plate itself (core/templates/tk-nuke.yml) is NOT used here
+        even though it looks like the obvious template - it's a stale,
+        non-versioned definition that was never updated to match what
+        tk-hiero-export actually writes (see hiero_copy_path/
+        hiero_render_path in core/templates/tk-hiero.yml, which insert a
+        p{version} folder that shot_plate omits), so resolving through it
+        would silently point at a directory that never receives ingested
+        plates.
+        """
+        tk = self.app.sgtk
+        try:
+            primary_root = tk.roots.get("primary")
+            if not primary_root:
+                return None
+
+            # tank_name (the project-root folder name, e.g. "STRM") is not
+            # a template field - it's resolved via the schema/roots, same
+            # as any other template path. Use any shot-level template to
+            # pull the correctly-resolved {Sequence}/{Shot} field values
+            # for this context, then compose the Projects/Plates path
+            # ourselves rather than depend on a template that requires
+            # {version}/{fileext} we don't know yet.
+            shot_root_template = tk.templates.get("shot_work_area_nuke")
+            if shot_root_template is None:
+                return None
+            fields = context.as_template_fields(shot_root_template)
+            sequence = fields.get("Sequence")
+            shot = fields.get("Shot")
+            if not sequence or not shot:
+                return None
+
+            # tank_name-named project folder under primary root - use
+            # context to resolve it via any already-working template
+            # rather than hardcoding; shot_work_area_nuke's resolved path
+            # already starts with "<primary_root>/<tank_name>/Artists/...",
+            # so derive the project-root folder from it directly.
+            resolved_work_area = shot_root_template.apply_fields(fields)
+            rel_path = os.path.relpath(resolved_work_area, primary_root)
+            project_folder = rel_path.split(os.sep)[0]
+
+            plate_root = os.path.join(
+                primary_root, project_folder, "Projects", "Plates", sequence, shot
+            )
+            return plate_root
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: could not resolve plate root "
+                "directory for shot",
                 exc_info=True,
             )
             return None
@@ -176,40 +263,49 @@ class NukeProjectSettingsHandler:
         """
         Resolves the on-disk EXR sequence path for the current shot's
         ingested plate, as a Nuke-style %04d printf path suitable for a
-        Read node. Prefers the resolved PublishedFile path when given;
-        otherwise falls back to applying the hiero_copy_path template
-        directly from context (covers the case where ingestion happened
-        but PublishedFile registration hasn't run/succeeded yet).
+        Read node. Prefers the resolved PublishedFile path when given
+        (once tk-hiero-export's copy-path registration is wired up on
+        this site); otherwise falls back to locating the shot's plate
+        root directory (see _find_plate_root_dir), picking the
+        highest-numbered p<version> subfolder, and scanning its {fileext}
+        subfolder (exr) for the actual frame sequence on disk - this is
+        the path currently in effect on this site, since PublishedFile
+        registration for the copied EXR sequence isn't happening yet
+        (confirmed: only "Hiero Plate" reference .mov entries exist,
+        never the .exr copy).
 
         Returns (printf_path, first_frame, last_frame) or (None, None, None)
         if no sequence could be found on disk.
         """
-        tk = self.app.sgtk
         seq_dir = None
 
         if publish and publish.get("path"):
             local_path = publish["path"].get("local_path")
             if local_path:
-                seq_dir = os.path.dirname(local_path)
+                candidate_dir = os.path.dirname(local_path)
+                # Only use the publish's directory if it actually contains
+                # EXRs - a "Hiero Plate" PublishedFile may point at the
+                # reference .mov instead (ref/ subfolder), which is not
+                # the frame sequence we want for a Read node.
+                if glob.glob(os.path.join(candidate_dir, "*.exr")):
+                    seq_dir = candidate_dir
 
         if seq_dir is None:
-            try:
-                copy_template = tk.templates.get("hiero_copy_path")
-                if copy_template is not None:
-                    fields = context.as_template_fields(copy_template)
-                    # fileext isn't resolvable from context alone; assume exr,
-                    # the standard ingest format for this pipeline.
-                    fields.setdefault("fileext", "exr")
-                    fields["SEQ"] = 1  # placeholder int, only used for dirname
-                    resolved_path = copy_template.apply_fields(fields)
-                    seq_dir = os.path.dirname(resolved_path)
-            except Exception:
-                logger.warning(
-                    "tk-nuke-projectsettings: could not resolve "
-                    "hiero_copy_path template for plate scan",
-                    exc_info=True,
+            plate_root = self._find_plate_root_dir(context)
+            if plate_root and os.path.isdir(plate_root):
+                version_dirs = sorted(
+                    d for d in glob.glob(os.path.join(plate_root, "p*"))
+                    if os.path.isdir(d)
                 )
-                return None, None, None
+                if version_dirs:
+                    latest_version_dir = version_dirs[-1]
+                    # EXRs live under a {fileext} subfolder, e.g. "exr".
+                    exr_subdirs = [
+                        d for d in glob.glob(os.path.join(latest_version_dir, "*"))
+                        if os.path.isdir(d) and glob.glob(os.path.join(d, "*.exr"))
+                    ]
+                    if exr_subdirs:
+                        seq_dir = exr_subdirs[0]
 
         if not seq_dir or not os.path.isdir(seq_dir):
             return None, None, None
