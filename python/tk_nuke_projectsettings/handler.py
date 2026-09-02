@@ -198,14 +198,16 @@ class NukeProjectSettingsHandler:
         per Hiero ingest/re-ingest (p001, p002, ...) - without needing to
         know the plate version number in advance.
 
-        Built directly from the primary storage root plus the resolved
-        {Sequence}/{Shot} context fields, mirroring how common.yml composes
-        shot_root/asset_root (Artists/{Sequence}/{Shot}/{Step}) and
-        tk-nuke.yml's shot_plate (Projects/Plates/{Sequence}/{Shot}/...) -
-        rather than walking up from a Nuke work-area path by directory-
-        level count, which is brittle against template changes (e.g.
-        shot_work_area_nuke resolves 6 levels deep:
-        Artists/{Sequence}/{Shot}/{Step}/Nuke/{Step}).
+        Built directly from tk.roots["primary"] plus the resolved
+        {Sequence}/{Shot} context fields. On this site tk.roots["primary"]
+        already resolves all the way to the project folder (e.g.
+        "/jobs/SlateX/str"), not just the shared storage mount
+        ("/jobs/SlateX") - confirmed directly: shot_work_area_nuke
+        resolves to "<primary_root>/Artists/{Sequence}/{Shot}/{Step}/Nuke/
+        {Step}", i.e. "Artists" is the very next path segment after
+        primary_root, with no separate project-code folder in between.
+        So the plate root is simply primary_root/Projects/Plates/
+        {Sequence}/{Shot} - no extra folder-name lookup needed.
 
         shot_plate itself (core/templates/tk-nuke.yml) is NOT used here
         even though it looks like the obvious template - it's a stale,
@@ -222,13 +224,11 @@ class NukeProjectSettingsHandler:
             if not primary_root:
                 return None
 
-            # tank_name (the project-root folder name, e.g. "STRM") is not
-            # a template field - it's resolved via the schema/roots, same
-            # as any other template path. Use any shot-level template to
-            # pull the correctly-resolved {Sequence}/{Shot} field values
-            # for this context, then compose the Projects/Plates path
-            # ourselves rather than depend on a template that requires
-            # {version}/{fileext} we don't know yet.
+            # Use any shot-level template to pull the correctly-resolved
+            # {Sequence}/{Shot} field values for this context, then
+            # compose the Projects/Plates path ourselves rather than
+            # depend on a template that requires {version}/{fileext} we
+            # don't know yet.
             shot_root_template = tk.templates.get("shot_work_area_nuke")
             if shot_root_template is None:
                 return None
@@ -238,17 +238,8 @@ class NukeProjectSettingsHandler:
             if not sequence or not shot:
                 return None
 
-            # tank_name-named project folder under primary root - use
-            # context to resolve it via any already-working template
-            # rather than hardcoding; shot_work_area_nuke's resolved path
-            # already starts with "<primary_root>/<tank_name>/Artists/...",
-            # so derive the project-root folder from it directly.
-            resolved_work_area = shot_root_template.apply_fields(fields)
-            rel_path = os.path.relpath(resolved_work_area, primary_root)
-            project_folder = rel_path.split(os.sep)[0]
-
             plate_root = os.path.join(
-                primary_root, project_folder, "Projects", "Plates", sequence, shot
+                primary_root, "Projects", "Plates", sequence, shot
             )
             return plate_root
         except Exception:
