@@ -49,6 +49,15 @@ OCIO_CONFIG_NAME = "aces_1.2"
 # path.
 PLATE_PUBLISH_TYPES = ["Hiero Plate"]
 
+# Name of a hidden root() user knob used purely as an in-session marker
+# (never saved meaningfully, just present on the Root object) recording
+# that apply_settings() has already run for the current script instance.
+# Used by apply_settings_if_new() so a save operation only applies
+# settings to a genuinely new/never-configured script, not to a script
+# that was already opened or template-generated (and may have had its
+# fps/frame range/OCIO deliberately changed by the artist since).
+_SETTINGS_APPLIED_KNOB = "sx_projectsettings_applied"
+
 
 class NukeProjectSettingsHandler:
     """
@@ -408,12 +417,63 @@ class NukeProjectSettingsHandler:
             last_frame,
         )
 
-    def apply_settings(self):
+    def _template_app_owns_this_load(self):
         """
-        Applies fps and frame range to nuke.root(). Called on new-file
-        creation and on script load, so both a fresh session and an
-        opened .nk pick up current ShotGrid values.
+        True if tk-nuke-template's own addOnScriptLoad callback is about
+        to run generate_template() for this same script-load event (i.e.
+        a brand-new/empty script, or one containing its
+        createTemplatePlaceholder node) and will explicitly call
+        apply_settings() itself once that finishes.
+
+        Only consulted by this handler's own addOnCreate/addOnScriptLoad
+        callbacks (see add_callbacks), to defer to tk-nuke-template's
+        explicit call instead of running apply_settings() a second,
+        redundant time on the same event. Deliberately NOT consulted
+        when tk-nuke-template calls apply_settings() directly - at that
+        point in generate_template() the createTemplatePlaceholder node
+        is often still present (it's intentionally kept, not deleted, by
+        that function's node cleanup pass), so this check would
+        otherwise cause the explicit call to defer to itself and
+        silently do nothing on every new-file-from-template.
         """
+        try:
+            nodes = nuke.allNodes()
+            if len(nodes) == 0:
+                return True
+            for node in nuke.allNodes("ModifyMetaData"):
+                if node.name() == "createTemplatePlaceholder":
+                    return True
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: could not determine whether "
+                "tk-nuke-template owns this load, proceeding as normal",
+                exc_info=True,
+            )
+        return False
+
+    def apply_settings(self, _skip_if_template_owns_load=False):
+        """
+        Applies fps and frame range to nuke.root(). Called on genuine
+        script open (an existing .nk being loaded, via this app's own
+        callbacks) and, explicitly, by tk-nuke-template once it has
+        finished building a brand-new script from a template.
+
+        _skip_if_template_owns_load is only ever passed True from this
+        handler's own add_callbacks() registrations - never by
+        tk-nuke-template's explicit call - so the new-file-from-template
+        case is handled exactly once, by that explicit call, regardless
+        of Nuke callback registration order between the two apps. See
+        _template_app_owns_this_load() for why the two call sites can't
+        share the same check.
+        """
+        if _skip_if_template_owns_load and self._template_app_owns_this_load():
+            logger.debug(
+                "tk-nuke-projectsettings: new-file-from-template detected, "
+                "deferring to tk-nuke-template's explicit call after "
+                "generate_template() completes"
+            )
+            return
+
         # Read the context fresh from the current engine rather than
         # self.app.context - the latter is captured once when the app
         # bundle is constructed and is not guaranteed to reflect a later
@@ -493,13 +553,95 @@ class NukeProjectSettingsHandler:
                 "shot yet, skipping Read node creation"
             )
 
+        self._mark_settings_applied(root)
+
+    def _mark_settings_applied(self, root):
+        """
+        Records on root() that apply_settings() has run for this script
+        instance, via a hidden, non-persisted user knob. Read by
+        _settings_already_applied() / apply_settings_if_new().
+        """
+        try:
+            if _SETTINGS_APPLIED_KNOB not in root.knobs():
+                knob = nuke.Boolean_Knob(_SETTINGS_APPLIED_KNOB)
+                knob.setFlag(nuke.INVISIBLE)
+                # Not saved to disk - this is purely an in-session marker
+                # so a later Save/Save As of THIS session doesn't
+                # re-trigger apply_settings_if_new(), while a fresh
+                # process opening the saved file has no marker and is
+                # correctly treated as needing settings again if nothing
+                # else (open/new callbacks) already applied them.
+                knob.setFlag(nuke.DO_NOT_WRITE)
+                root.addKnob(knob)
+            root[_SETTINGS_APPLIED_KNOB].setValue(True)
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: could not set in-session "
+                "settings-applied marker",
+                exc_info=True,
+            )
+
+    def _settings_already_applied(self, root):
+        try:
+            return (
+                _SETTINGS_APPLIED_KNOB in root.knobs()
+                and root[_SETTINGS_APPLIED_KNOB].value()
+            )
+        except Exception:
+            return False
+
+    def apply_settings_if_new(self):
+        """
+        Applies settings only if this script instance hasn't already had
+        them applied this session (via open/new-file callbacks or a
+        previous call to this method). Intended for the save/save_as
+        scene-operation hook: a script saved for the first time without
+        ever going through the normal open/new triggers (e.g. built up
+        by hand, or any other path that bypassed those callbacks) still
+        gets fps/frame range/OCIO/plate Read set before it hits disk.
+        Deliberately a no-op for a script that was already
+        opened/template-generated in this session, so it never
+        overwrites values an artist has since changed on purpose - see
+        _mark_settings_applied().
+        """
+        root = nuke.root()
+        if self._settings_already_applied(root):
+            logger.debug(
+                "tk-nuke-projectsettings: settings already applied this "
+                "session, skipping on save"
+            )
+            return
+        logger.info(
+            "tk-nuke-projectsettings: script has no settings-applied "
+            "marker, applying settings before save"
+        )
+        self.apply_settings()
+
+    def _apply_settings_from_callback(self):
+        """
+        nuke.addOnCreate/addOnScriptLoad invoke their callback with no
+        arguments, so this thin wrapper is what actually gets registered
+        - it's what lets these two callback-driven call sites pass
+        _skip_if_template_owns_load=True, while tk-nuke-template's direct
+        call to self.app.handler.apply_settings() (see
+        tk-nuke-template's generate_template()) goes straight to
+        apply_settings() itself and is unaffected by this flag.
+        """
+        self.apply_settings(_skip_if_template_owns_load=True)
+
     def add_callbacks(self):
         # Run once when a brand new/empty script is created, and again
-        # whenever a script is loaded/opened - covers both "new file from
-        # ShotGrid" and "open an existing published .nk" workflows.
-        nuke.addOnCreate(self.apply_settings, nodeClass="Root")
-        nuke.addOnScriptLoad(self.apply_settings, nodeClass="Root")
+        # whenever a script is loaded/opened - covers both a genuine
+        # "open an existing published .nk" workflow and a fallback for
+        # new-file creation if tk-nuke-projectsettings is ever used
+        # without tk-nuke-template in the environment. When
+        # tk-nuke-template IS present, its own explicit call after
+        # generate_template() (not this callback) is what actually
+        # handles the new-file-from-template case - see
+        # _template_app_owns_this_load().
+        nuke.addOnCreate(self._apply_settings_from_callback, nodeClass="Root")
+        nuke.addOnScriptLoad(self._apply_settings_from_callback, nodeClass="Root")
 
     def remove_callbacks(self):
-        nuke.removeOnCreate(self.apply_settings, nodeClass="Root")
-        nuke.removeOnScriptLoad(self.apply_settings, nodeClass="Root")
+        nuke.removeOnCreate(self._apply_settings_from_callback, nodeClass="Root")
+        nuke.removeOnScriptLoad(self._apply_settings_from_callback, nodeClass="Root")
