@@ -58,11 +58,28 @@ PLATE_PUBLISH_TYPES = ["Hiero Plate"]
 # fps/frame range/OCIO deliberately changed by the artist since).
 _SETTINGS_APPLIED_KNOB = "sx_projectsettings_applied"
 
+# Prefix used for the Nuke Format name registered for a given plate
+# resolution (see _apply_format_from_plate). Includes the dimensions so
+# a second shot at the same resolution reuses the existing nuke.Format
+# object (nuke.addFormat raises if a format of the same name but
+# different dimensions already exists) instead of erroring or
+# accumulating duplicate same-named formats across shots in one session.
+_FORMAT_NAME_PREFIX = "sx_plate"
+
 
 class NukeProjectSettingsHandler:
     """
-    Applies ShotGrid project/shot settings (fps, frame range, OCIO, and the
-    ingested plate as a Read node) to the current Nuke script automatically.
+    Applies ShotGrid project/shot settings (fps, frame range, OCIO, the
+    ingested plate as a Read node, and the project/full-size format) to
+    the current Nuke script automatically.
+
+    Full-size format specifically is ALWAYS derived from the actual
+    ingested EXR plate's own width/height (read directly off the file via
+    a throwaway Read node - see _read_exr_dimensions()), never from a
+    hardcoded resolution. If no plate is ingested yet, or its dimensions
+    can't be read, the script's existing format is left untouched rather
+    than substituting a default - see apply_settings()'s format-handling
+    block.
 
     Data source priority for fps / frame range:
     1. A live ShotGrid query against the current context. This is the
@@ -202,54 +219,68 @@ class NukeProjectSettingsHandler:
 
     def _find_plate_root_dir(self, context):
         """
-        Resolves the shot's plate root directory - the "Projects/Plates/
-        {Sequence}/{Shot}" folder that contains one p<version> subfolder
-        per Hiero ingest/re-ingest (p001, p002, ...) - without needing to
-        know the plate version number in advance.
+        Resolves the shot's plate root directory - the "Projects/
+        {Projectcode}/Plates/{Sequence}/{Shot}" folder that contains one
+        p<version> subfolder per Hiero ingest/re-ingest (p001, p002, ...) -
+        without needing to know the plate version number in advance.
 
-        Built directly from tk.roots["primary"] plus the resolved
-        {Sequence}/{Shot} context fields. On this site tk.roots["primary"]
-        already resolves all the way to the project folder (e.g.
-        "/jobs/SlateX/str"), not just the shared storage mount
-        ("/jobs/SlateX") - confirmed directly: shot_work_area_nuke
-        resolves to "<primary_root>/Artists/{Sequence}/{Shot}/{Step}/Nuke/
-        {Step}", i.e. "Artists" is the very next path segment after
-        primary_root, with no separate project-code folder in between.
-        So the plate root is simply primary_root/Projects/Plates/
-        {Sequence}/{Shot} - no extra folder-name lookup needed.
+        Derived entirely from the "shot_plate" path template
+        (core/templates/tk-nuke.yml in nfa-shotgun-configuration) via
+        context.as_template_fields() + template.apply_fields(), rather
+        than hand-joining path segments here. This is deliberate: an
+        earlier revision of this method built the path by manually
+        os.path.join()-ing "Projects", "Plates", sequence, shot onto
+        tk.roots["primary"], duplicating the template's own logic in a
+        second place - exactly the kind of drift this method is meant to
+        avoid. Now, if the studio's folder convention changes again (as it
+        did when {Projectcode} moved from "implicit at the project root"
+        to "an explicit folder under Artists/Projects"), this method picks
+        up the change automatically from the template with no edit needed
+        here.
 
-        shot_plate itself (core/templates/tk-nuke.yml) is NOT used here
-        even though it looks like the obvious template - it's a stale,
-        non-versioned definition that was never updated to match what
-        tk-hiero-export actually writes (see hiero_copy_path/
-        hiero_render_path in core/templates/tk-hiero.yml, which insert a
-        p{version} folder that shot_plate omits), so resolving through it
-        would silently point at a directory that never receives ingested
-        plates.
+        shot_plate's own definition ends in "{Shot}.{SEQ}.exr" - a
+        FILENAME, not the version-numbered directory hiero actually
+        ingests into (shot_plate has no {version}/p{version} segment,
+        unlike hiero_copy_path/hiero_render_path in tk-hiero.yml, which do
+        insert one - shot_plate was never updated to match what
+        tk-hiero-export actually writes). So this method resolves
+        shot_plate with a placeholder version/frame and then walks BACK
+        UP two path segments (past the filename, past the {Sequence}/
+        {Shot} leaf it already has) to recover the true
+        "Projects/{Projectcode}/Plates/{Sequence}/{Shot}" root - i.e. it
+        takes the directory two levels above what shot_plate resolves to,
+        which is exactly the {Shot} folder itself, since shot_plate's
+        definition is "{shot_plate_root}/{Shot}.{SEQ}.exr" with no
+        intermediate folder between {Shot} and the filename. This still
+        does not require knowing the real plate version number, since the
+        version-numbered p<version> subfolder is discovered by the
+        existing glob-based scan in _resolve_plate_sequence_path(), not by
+        this method.
         """
         tk = self.app.sgtk
         try:
-            primary_root = tk.roots.get("primary")
-            if not primary_root:
+            shot_plate_template = tk.templates.get("shot_plate")
+            if shot_plate_template is None:
                 return None
 
-            # Use any shot-level template to pull the correctly-resolved
-            # {Sequence}/{Shot} field values for this context, then
-            # compose the Projects/Plates path ourselves rather than
-            # depend on a template that requires {version}/{fileext} we
-            # don't know yet.
-            shot_root_template = tk.templates.get("shot_work_area_nuke")
-            if shot_root_template is None:
-                return None
-            fields = context.as_template_fields(shot_root_template)
+            fields = context.as_template_fields(shot_plate_template)
             sequence = fields.get("Sequence")
             shot = fields.get("Shot")
             if not sequence or not shot:
                 return None
 
-            plate_root = os.path.join(
-                primary_root, "Projects", "Plates", sequence, shot
-            )
+            # SEQ (a Toolkit "sequence" key, e.g. frame numbers) isn't
+            # known yet at this point - fill in a syntactically-valid
+            # placeholder purely so the template can resolve to a path
+            # string; only the parent directory of that path is used
+            # below, so the placeholder's actual value never surfaces.
+            fields["SEQ"] = 0
+            resolved_file_path = shot_plate_template.apply_fields(fields)
+
+            # resolved_file_path ends in ".../{Shot}/{Shot}.0000.exr" -
+            # its immediate parent directory is the {Shot} folder, i.e.
+            # exactly the plate root this method returns.
+            plate_root = os.path.dirname(resolved_file_path)
             return plate_root
         except Exception:
             logger.warning(
@@ -368,6 +399,150 @@ class NukeProjectSettingsHandler:
                 exc_info=True,
             )
 
+    def _read_exr_dimensions(self, printf_path, first_frame, last_frame):
+        """
+        Reads the actual width/height of the ingested EXR plate sequence
+        by creating a throwaway, never-shown Read node pointed at one real
+        frame and querying its resolved width()/height() - which reflect
+        the file's real display-window dimensions (backed by the EXR
+        header's own displayWindow, the same data nuke.toNode(...).
+        metadata()'s "input/width"/"input/height" keys expose), not a
+        value inferred from the script or hardcoded anywhere in this
+        pipeline.
+
+        A dedicated throwaway node (rather than reusing/inspecting the
+        real plate_<Shot> Read node this handler creates elsewhere) is
+        used deliberately: this method may run before that node exists
+        yet (format must be known before or alongside Read-node creation,
+        not after), and creating it does not depend on
+        _create_or_update_plate_read()'s own existing-node/repath-guard
+        logic at all - the two are independent concerns.
+
+        Returns (width, height) as ints, or (None, None) if no frame
+        could be read (e.g. missing/corrupt file) - callers must treat
+        that as "dimensions unknown" and must NOT substitute a hardcoded
+        resolution; see apply_settings()'s handling of this return value.
+        """
+        if not printf_path or first_frame is None:
+            return None, None
+
+        # Resolve one concrete frame path to read - Nuke's Read node can
+        # evaluate width()/height() from a single frame without needing
+        # the full first/last range set correctly first.
+        sample_frame = first_frame
+        try:
+            sample_path = printf_path.replace(os.sep, "/") % sample_frame
+        except (TypeError, ValueError):
+            logger.warning(
+                "tk-nuke-projectsettings: could not format printf path "
+                "'%s' with frame %s to read EXR dimensions",
+                printf_path,
+                sample_frame,
+            )
+            return None, None
+
+        if not os.path.isfile(sample_path):
+            logger.warning(
+                "tk-nuke-projectsettings: sample plate frame '%s' does "
+                "not exist on disk, cannot read EXR dimensions",
+                sample_path,
+            )
+            return None, None
+
+        probe_node = None
+        try:
+            probe_node = nuke.createNode("Read", inpanel=False)
+            # Keep the throwaway node out of the node graph the artist
+            # sees and out of anything that might process it - it exists
+            # purely to let Nuke's own EXR reader tell us the real
+            # dimensions, and is deleted immediately after.
+            probe_node["file"].setValue(sample_path)
+            probe_node["first"].setValue(sample_frame)
+            probe_node["last"].setValue(sample_frame)
+            width = int(probe_node.width())
+            height = int(probe_node.height())
+            if width <= 0 or height <= 0:
+                logger.warning(
+                    "tk-nuke-projectsettings: EXR dimensions read as "
+                    "non-positive (%sx%s) from '%s', treating as unknown",
+                    width,
+                    height,
+                    sample_path,
+                )
+                return None, None
+            return width, height
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: failed to read EXR dimensions "
+                "from '%s'",
+                sample_path,
+                exc_info=True,
+            )
+            return None, None
+        finally:
+            if probe_node is not None:
+                try:
+                    nuke.delete(probe_node)
+                except Exception:
+                    logger.warning(
+                        "tk-nuke-projectsettings: could not remove "
+                        "throwaway EXR-probe Read node",
+                        exc_info=True,
+                    )
+
+    def _apply_format_from_plate(self, root, width, height):
+        """
+        Sets the Nuke script's project/full-size format (root()["format"])
+        to a format matching the given width/height, registering a new
+        nuke.Format via nuke.addFormat() if one matching these exact
+        dimensions doesn't already exist in this session.
+
+        Deliberately keyed on (width, height) in the format's own name
+        (see _FORMAT_NAME_PREFIX) rather than always calling addFormat()
+        unconditionally - nuke.addFormat() with a name that already
+        exists at a DIFFERENT size raises, and re-adding the same
+        name/size repeatedly across every apply_settings() call in a
+        session (e.g. on every save) would either error or accumulate
+        redundant work for no benefit. A second shot using the same
+        plate resolution reuses the same registered format instead of
+        creating a duplicate.
+
+        Never called with a hardcoded fallback resolution - if width/
+        height are None, the caller (apply_settings) simply does not
+        call this method at all and leaves the script's existing format
+        untouched; see apply_settings()'s format-handling block and its
+        log message for the missing-metadata case.
+        """
+        format_name = "%s_%dx%d" % (_FORMAT_NAME_PREFIX, width, height)
+        try:
+            existing = None
+            for fmt in nuke.formats():
+                if fmt.name() == format_name:
+                    existing = fmt
+                    break
+
+            if existing is None:
+                # TCL format string: "width height pixel_aspect name"
+                nuke.addFormat("%d %d 1.0 %s" % (width, height, format_name))
+
+            if root["format"].value().name() != format_name:
+                root["format"].setValue(format_name)
+                logger.info(
+                    "tk-nuke-projectsettings: set project format to %s "
+                    "(%dx%d, from ingested plate EXR metadata)",
+                    format_name,
+                    width,
+                    height,
+                )
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: could not set project format "
+                "to %dx%d from plate metadata",
+                width,
+                height,
+                exc_info=True,
+            )
+
     def _create_or_update_plate_read(self, context, printf_path, first_frame, last_frame):
         """
         Creates a Read node for the ingested plate sequence if one doesn't
@@ -453,10 +628,12 @@ class NukeProjectSettingsHandler:
 
     def apply_settings(self, _skip_if_template_owns_load=False):
         """
-        Applies fps and frame range to nuke.root(). Called on genuine
-        script open (an existing .nk being loaded, via this app's own
-        callbacks) and, explicitly, by tk-nuke-template once it has
-        finished building a brand-new script from a template.
+        Applies OCIO, fps, frame range, the ingested-plate Read node, and
+        the project/full-size format (derived from that plate's actual
+        EXR dimensions) to nuke.root(). Called on genuine script open (an
+        existing .nk being loaded, via this app's own callbacks) and,
+        explicitly, by tk-nuke-template once it has finished building a
+        brand-new script from a template.
 
         _skip_if_template_owns_load is only ever passed True from this
         handler's own add_callbacks() registrations - never by
@@ -551,6 +728,33 @@ class NukeProjectSettingsHandler:
             logger.info(
                 "tk-nuke-projectsettings: no ingested plate found for this "
                 "shot yet, skipping Read node creation"
+            )
+
+        # --- Full-size project format: derived from the ingested plate's
+        # own EXR dimensions, never hardcoded. Uses disk_first (the first
+        # frame actually found on disk for the ingested sequence) rather
+        # than first_frame/last_frame above, since those may have come
+        # from sg_cut_in/sg_cut_out instead of the disk scan and are not
+        # guaranteed to be a frame that actually exists in this
+        # particular plate sequence. ---
+        if printf_path and disk_first is not None:
+            width, height = self._read_exr_dimensions(
+                printf_path, disk_first, disk_last
+            )
+            if width is not None and height is not None:
+                self._apply_format_from_plate(root, width, height)
+            else:
+                logger.info(
+                    "tk-nuke-projectsettings: could not read EXR "
+                    "dimensions from the ingested plate, leaving project "
+                    "format untouched (never falling back to a "
+                    "hardcoded resolution)"
+                )
+        else:
+            logger.info(
+                "tk-nuke-projectsettings: no ingested plate found for "
+                "this shot yet, leaving project format untouched (never "
+                "falling back to a hardcoded resolution)"
             )
 
         self._mark_settings_applied(root)
