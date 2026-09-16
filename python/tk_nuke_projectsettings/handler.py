@@ -226,17 +226,48 @@ class NukeProjectSettingsHandler:
 
         Derived entirely from the "shot_plate" path template
         (core/templates/tk-nuke.yml in nfa-shotgun-configuration) via
-        context.as_template_fields() + template.apply_fields(), rather
-        than hand-joining path segments here. This is deliberate: an
-        earlier revision of this method built the path by manually
-        os.path.join()-ing "Projects", "Plates", sequence, shot onto
-        tk.roots["primary"], duplicating the template's own logic in a
-        second place - exactly the kind of drift this method is meant to
-        avoid. Now, if the studio's folder convention changes again (as it
-        did when {Projectcode} moved from "implicit at the project root"
-        to "an explicit folder under Artists/Projects"), this method picks
-        up the change automatically from the template with no edit needed
-        here.
+        template.apply_fields(), rather than hand-joining path segments
+        here. This is deliberate: an earlier revision of this method
+        built the path by manually os.path.join()-ing "Projects",
+        "Plates", sequence, shot onto tk.roots["primary"], duplicating
+        the template's own logic in a second place - exactly the kind of
+        drift this method is meant to avoid. Now, if the studio's folder
+        convention changes again (as it did when {Projectcode} moved
+        from "implicit at the project root" to "an explicit folder under
+        Artists/Projects"), this method picks up the change automatically
+        from the template with no edit needed here.
+
+        IMPORTANT (found 2026-09-16, live on this site): the Sequence/
+        Shot field values used to fill in shot_plate are deliberately
+        resolved via context.as_template_fields(nuke_shot_work) - the
+        WORKING-FILE template - rather than
+        context.as_template_fields(shot_plate_template) directly.
+        as_template_fields() validates the resolved path against
+        Toolkit's path cache, which requires
+        tk.create_filesystem_structure() to have already been run for
+        that exact folder. Projects/Plates/{Sequence}/{Shot} is NEVER
+        created that way on this site - Hiero's tk-hiero-export writes
+        EXRs there via a direct file copy (hiero_copy_path), completely
+        bypassing Toolkit's folder-creation API, for every shot, always.
+        Confirmed by direct inspection: PathCache.get_paths("Shot", ...)
+        for a shot with fully-working Artists/ and Publish/ folders
+        returned zero registered paths under Projects/Plates/, and
+        running tk.create_filesystem_structure() again (Shot-scoped,
+        Project-scoped, with and without an engine filter) made no
+        difference - Toolkit reports "already up to date" because
+        nothing has ever queued a creation event for that branch, not
+        because the folder is actually registered. Calling
+        as_template_fields(shot_plate_template) directly therefore always
+        raises TankError, on every shot, permanently - not a transient
+        state fixable by re-running folder creation.
+        nuke_shot_work resolves the exact same Sequence/Shot values (it's
+        the same Shot, same context) and validates cleanly, because
+        Workfiles2's own folder creation IS what put the artist's .nk
+        file under Artists/ in the first place. Those field values are
+        then applied to shot_plate_template via apply_fields() - pure
+        string substitution, which never touches the path cache - so
+        the never-created Projects/Plates folder is never validated
+        against, only its path string is built.
 
         shot_plate's own definition ends in "{Shot}.{SEQ}.exr" - a
         FILENAME, not the version-numbered directory hiero actually
@@ -263,7 +294,14 @@ class NukeProjectSettingsHandler:
             if shot_plate_template is None:
                 return None
 
-            fields = context.as_template_fields(shot_plate_template)
+            # See the IMPORTANT note above: resolve fields via the
+            # working-file template (validates cleanly against the path
+            # cache) rather than shot_plate_template itself (would raise
+            # TankError - Projects/Plates is never Toolkit-created here).
+            work_template = tk.templates.get("nuke_shot_work")
+            if work_template is None:
+                return None
+            fields = context.as_template_fields(work_template)
             sequence = fields.get("Sequence")
             shot = fields.get("Shot")
             if not sequence or not shot:
@@ -323,19 +361,49 @@ class NukeProjectSettingsHandler:
 
         if seq_dir is None:
             plate_root = self._find_plate_root_dir(context)
-            if plate_root and os.path.isdir(plate_root):
+            if not plate_root:
+                logger.info(
+                    "tk-nuke-projectsettings: _find_plate_root_dir() "
+                    "returned no plate root (shot_plate template did not "
+                    "resolve for this context) - no plate to scan"
+                )
+            elif not os.path.isdir(plate_root):
+                logger.info(
+                    "tk-nuke-projectsettings: resolved plate root '%s' "
+                    "does not exist on disk - has this shot's plate been "
+                    "ingested yet?",
+                    plate_root,
+                )
+            else:
                 version_dirs = sorted(
                     d for d in glob.glob(os.path.join(plate_root, "p*"))
                     if os.path.isdir(d)
                 )
-                if version_dirs:
+                if not version_dirs:
+                    logger.info(
+                        "tk-nuke-projectsettings: plate root '%s' exists "
+                        "but has no p<version> subfolders (e.g. p001) - "
+                        "nothing ingested here yet",
+                        plate_root,
+                    )
+                else:
                     latest_version_dir = version_dirs[-1]
                     # EXRs live under a {fileext} subfolder, e.g. "exr".
                     exr_subdirs = [
                         d for d in glob.glob(os.path.join(latest_version_dir, "*"))
                         if os.path.isdir(d) and glob.glob(os.path.join(d, "*.exr"))
                     ]
-                    if exr_subdirs:
+                    if not exr_subdirs:
+                        logger.info(
+                            "tk-nuke-projectsettings: latest version folder "
+                            "'%s' has no subfolder containing .exr files - "
+                            "checked immediate subfolders only (e.g. "
+                            "'exr/'); if EXRs live deeper or under a "
+                            "different extension folder, they won't be "
+                            "found",
+                            latest_version_dir,
+                        )
+                    else:
                         seq_dir = exr_subdirs[0]
 
         if not seq_dir or not os.path.isdir(seq_dir):
@@ -346,7 +414,19 @@ class NukeProjectSettingsHandler:
         frame_files = sorted(glob.glob(os.path.join(seq_dir, "*.exr")))
 
         if not frame_files:
+            logger.info(
+                "tk-nuke-projectsettings: sequence directory '%s' resolved "
+                "but contains no .exr files",
+                seq_dir,
+            )
             return None, None, None
+
+        logger.info(
+            "tk-nuke-projectsettings: found %d EXR frame(s) for plate in "
+            "'%s'",
+            len(frame_files),
+            seq_dir,
+        )
 
         frame_numbers = []
         frame_re = re.compile(r"\.(\d+)\.exr$", re.IGNORECASE)
