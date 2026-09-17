@@ -31,7 +31,54 @@ logger = sgtk.platform.get_logger(__name__)
 # Nuke 14+ ships ACES 1.2 as a built-in OCIO config choice - no config file
 # on disk is needed, just these two root() knob values.
 OCIO_COLOR_MANAGEMENT = "OCIO"
-OCIO_CONFIG_NAME = "aces_1.2"
+
+# Per-project color pipeline presets, keyed by the ShotGrid Project field
+# sg_color_pipeline (single-select dropdown, added directly in the
+# ShotGrid webapp - Project entity, no config-side schema change needed
+# for the field itself to exist). Each preset supplies every colorspace
+# value this app or tk-nuke-writenode's static YAML would otherwise
+# hardcode for a single project.
+#
+# Added because different SlateX projects genuinely use different color
+# pipelines (unlike NFA, which has one fixed studio-wide OCIO/ACES
+# config for every project) - see conversation history. storm's existing
+# values (aces_1.2 / ACEScg) are kept as DEFAULT_COLOR_PIPELINE_KEY below
+# so a project with sg_color_pipeline unset (including storm today, if
+# the field is added but never populated) behaves exactly as before -
+# this app never changes behavior for an unconfigured project.
+#
+# plate_read_colorspace is the OCIO role/colorspace name applied to the
+# ingested plate's Read node (see _create_or_update_plate_read) - this
+# was previously never set at all (a real bug: the Read node sat at
+# Nuke's OCIO default regardless of what root()'s working colorspace
+# was set to). working_colorspace is informational here (documents what
+# the project's write nodes are expected to render in) and is not
+# currently applied to any Nuke knob by this app - tk-nuke-writenode's
+# own static per-category YAML settings (env/includes/settings/
+# tk-nuke-writenode.yml) still separately hardcode a write colorspace,
+# since that app has no hook/settings mechanism for a dynamic per-project
+# value. Keeping this table here (rather than duplicating it in the
+# writenode YAML) is intentional: this is the one place in the pipeline
+# a new sg_color_pipeline value needs to be added.
+DEFAULT_COLOR_PIPELINE_KEY = "aces_acescg"
+
+COLOR_PIPELINE_PRESETS = {
+    "aces_acescg": {
+        "ocio_config": "aces_1.2",
+        "working_colorspace": "ACES - ACEScg",
+        "plate_read_colorspace": "ACES - ACEScg",
+    },
+    "aces_2065_1": {
+        "ocio_config": "aces_1.2",
+        "working_colorspace": "ACES - ACES2065-1",
+        "plate_read_colorspace": "ACES - ACES2065-1",
+    },
+    "rec709_sdr": {
+        "ocio_config": "nuke_default",
+        "working_colorspace": "linear",
+        "plate_read_colorspace": "sRGB",
+    },
+}
 
 # PublishedFile.published_file_type name registered by tk-hiero-export for
 # the copied/ingested plate sequence. On this site only two
@@ -107,6 +154,54 @@ class NukeProjectSettingsHandler:
 
     def __init__(self):
         self.app = sgtk.platform.current_bundle()
+
+    def _get_color_pipeline(self, context):
+        """
+        Resolves the current project's color pipeline preset (see
+        COLOR_PIPELINE_PRESETS) the same way _get_fps resolves sg_fps:
+        a live ShotGrid query against sg_color_pipeline first, an env
+        var staged by before_app_launch.py (NFA_COLOR_PIPELINE) as a
+        fallback if the query fails, and DEFAULT_COLOR_PIPELINE_KEY
+        (storm's existing aces_acescg values) if neither yields a
+        recognised value - so a project with the field unset, or set to
+        something not yet in COLOR_PIPELINE_PRESETS, behaves exactly as
+        this app did before per-project pipelines existed.
+
+        Returns the preset dict (never None).
+        """
+        pipeline_key = None
+        project = context.project
+        if project:
+            try:
+                sg = self.app.shotgun
+                result = sg.find_one(
+                    "Project", [["id", "is", project["id"]]], ["sg_color_pipeline"]
+                )
+                if result and result.get("sg_color_pipeline"):
+                    pipeline_key = result["sg_color_pipeline"]
+            except Exception:
+                logger.warning(
+                    "tk-nuke-projectsettings: live sg_color_pipeline query "
+                    "failed, falling back to NFA_COLOR_PIPELINE env var",
+                    exc_info=True,
+                )
+
+        if not pipeline_key:
+            pipeline_key = os.environ.get("NFA_COLOR_PIPELINE")
+
+        if pipeline_key and pipeline_key in COLOR_PIPELINE_PRESETS:
+            return COLOR_PIPELINE_PRESETS[pipeline_key]
+
+        if pipeline_key:
+            logger.warning(
+                "tk-nuke-projectsettings: sg_color_pipeline value '%s' has "
+                "no matching preset in COLOR_PIPELINE_PRESETS, falling "
+                "back to default (%s)",
+                pipeline_key,
+                DEFAULT_COLOR_PIPELINE_KEY,
+            )
+
+        return COLOR_PIPELINE_PRESETS[DEFAULT_COLOR_PIPELINE_KEY]
 
     def _get_fps(self, context):
         project = context.project
@@ -450,32 +545,35 @@ class NukeProjectSettingsHandler:
 
         return printf_path, first_frame, last_frame
 
-    def _apply_ocio(self, root):
+    def _apply_ocio(self, root, ocio_config_name):
         """
-        Sets Nuke's built-in ACES 1.2 OCIO config via Project Settings
-        knobs. This is the same as an artist manually setting Color
-        Management: OCIO and OCIO Config: aces_1.2 in the dropdown -
-        no external .ocio file is used, Nuke 14+ ships this config
-        internally.
+        Sets Nuke's built-in OCIO config via Project Settings knobs, per
+        the current project's color pipeline preset (see
+        _get_color_pipeline). This is the same as an artist manually
+        setting Color Management: OCIO and OCIO Config: <name> in the
+        dropdown - no external .ocio file is used for the ACES configs,
+        Nuke 14+ ships them internally.
         """
         try:
             if root["colorManagement"].value() != OCIO_COLOR_MANAGEMENT:
                 root["colorManagement"].setValue(OCIO_COLOR_MANAGEMENT)
-            if root["OCIO_config"].value() != OCIO_CONFIG_NAME:
-                root["OCIO_config"].setValue(OCIO_CONFIG_NAME)
+            if root["OCIO_config"].value() != ocio_config_name:
+                root["OCIO_config"].setValue(ocio_config_name)
             logger.info(
                 "tk-nuke-projectsettings: set color management to OCIO / %s",
-                OCIO_CONFIG_NAME,
+                ocio_config_name,
             )
         except (KeyError, ValueError):
             # KeyError: knob name not present on this root() (older/newer
             # Nuke version with different knob names). ValueError: this
-            # Nuke build's OCIO_config dropdown doesn't include aces_1.2.
-            # Either way, log and move on rather than breaking script
-            # creation over a settings knob.
+            # Nuke build's OCIO_config dropdown doesn't include the
+            # requested config name. Either way, log and move on rather
+            # than breaking script creation over a settings knob.
             logger.warning(
                 "tk-nuke-projectsettings: could not set colorManagement/"
-                "OCIO_config to OCIO/aces_1.2 - check Nuke version",
+                "OCIO_config to OCIO/%s - check Nuke version and project's "
+                "sg_color_pipeline value",
+                ocio_config_name,
                 exc_info=True,
             )
 
@@ -623,7 +721,9 @@ class NukeProjectSettingsHandler:
                 exc_info=True,
             )
 
-    def _create_or_update_plate_read(self, context, printf_path, first_frame, last_frame):
+    def _create_or_update_plate_read(
+        self, context, printf_path, first_frame, last_frame, plate_colorspace
+    ):
         """
         Creates a Read node for the ingested plate sequence if one doesn't
         already exist for this shot (identified by node name
@@ -632,6 +732,22 @@ class NukeProjectSettingsHandler:
         directory this handler set it to - if an artist has repathed it
         (e.g. to a newer manual version, or somewhere else entirely) their
         edit is left alone rather than silently overwritten.
+
+        plate_colorspace is applied to the Read node's own "colorspace"
+        knob (from the current project's color pipeline preset - see
+        _get_color_pipeline / COLOR_PIPELINE_PRESETS). Previously this
+        method never touched the Read node's input colorspace at all, so
+        it sat at Nuke's own default (linear or sRGB depending on version)
+        regardless of what OCIO config root() was set to - a real,
+        likely-noticed gap for artists, since incoming footage could
+        render/composite incorrectly until someone set it by hand. Only
+        applied on node creation and on a refresh of a still-matching
+        existing node (same guard as file/first/last below) - never
+        overwritten if an artist has since changed it deliberately on a
+        node this handler otherwise recognises as still "its own"
+        (matching path), since an explicit colorspace choice by an artist
+        is exactly the kind of edit the existing repath-guard above is
+        meant to respect.
         """
         if not printf_path:
             return
@@ -664,12 +780,28 @@ class NukeProjectSettingsHandler:
             read_node["origfirst"].setValue(first_frame)
             read_node["origlast"].setValue(last_frame)
 
+        if plate_colorspace:
+            try:
+                if read_node["colorspace"].value() != plate_colorspace:
+                    read_node["colorspace"].setValue(plate_colorspace)
+            except (KeyError, ValueError):
+                logger.warning(
+                    "tk-nuke-projectsettings: could not set Read node "
+                    "'%s' colorspace to '%s' - check the value exists "
+                    "in this Nuke build's OCIO config",
+                    node_name,
+                    plate_colorspace,
+                    exc_info=True,
+                )
+
         logger.info(
-            "tk-nuke-projectsettings: set Read node '%s' to %s (%s-%s)",
+            "tk-nuke-projectsettings: set Read node '%s' to %s (%s-%s, "
+            "colorspace %s)",
             node_name,
             printf_path,
             first_frame,
             last_frame,
+            plate_colorspace,
         )
 
     def _template_app_owns_this_load(self):
@@ -750,8 +882,12 @@ class NukeProjectSettingsHandler:
 
         root = nuke.root()
 
-        # --- Color management: ACES 1.2 via Nuke's built-in OCIO config ---
-        self._apply_ocio(root)
+        # --- Resolve this project's color pipeline once, used for both
+        # the OCIO config below and the plate Read node's colorspace ---
+        color_pipeline = self._get_color_pipeline(context)
+
+        # --- Color management: per-project OCIO config ---
+        self._apply_ocio(root, color_pipeline["ocio_config"])
 
         # --- FPS ---
         fps = self._get_fps(context)
@@ -802,7 +938,11 @@ class NukeProjectSettingsHandler:
         # --- Auto-pickup: Read node from the ingested plate sequence ---
         if printf_path:
             self._create_or_update_plate_read(
-                context, printf_path, disk_first, disk_last
+                context,
+                printf_path,
+                disk_first,
+                disk_last,
+                color_pipeline["plate_read_colorspace"],
             )
         else:
             logger.info(
