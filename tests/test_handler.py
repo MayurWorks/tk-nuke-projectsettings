@@ -419,6 +419,7 @@ def _setup_handler(hm, project_row=None, shot_row=None, publishes=None,
     ))
     templates = {
         "shot_work_area_nuke": FakeTemplate("Artists/str/{Sequence}/{Shot}/{Step}/Nuke/{Step}"),
+        "nuke_shot_work": FakeTemplate("Artists/str/{Sequence}/{Shot}/{Step}/Nuke/{Step}/{Shot}_{Step}_v{version}.nk"),
         "shot_plate": shot_plate_template,
     }
     app = FakeApp(shotgun=shotgun, templates=templates)
@@ -486,7 +487,7 @@ class TestColorManagement:
     def test_ocio_applied(self, handler_module):
         handler, context, _ = _setup_handler(handler_module)
         root = handler_module["fake_nuke"].root()
-        handler._apply_ocio(root)
+        handler._apply_ocio(root, "aces_1.2")
         assert root["colorManagement"].value() == "OCIO"
         assert root["OCIO_config"].value() == "aces_1.2"
 
