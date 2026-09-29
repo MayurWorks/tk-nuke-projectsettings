@@ -26,6 +26,8 @@ import glob
 import sgtk
 import nuke
 
+from . import pipeline_settings
+
 logger = sgtk.platform.get_logger(__name__)
 
 # Nuke 14+ ships ACES 1.2 as a built-in OCIO config choice - no config file
@@ -155,7 +157,7 @@ class NukeProjectSettingsHandler:
     def __init__(self):
         self.app = sgtk.platform.current_bundle()
 
-    def _get_color_pipeline(self, context):
+    def _get_color_pipeline(self, context, settings=None):
         """
         Resolves the current project's color pipeline preset (see
         COLOR_PIPELINE_PRESETS) the same way _get_fps resolves sg_fps:
@@ -170,21 +172,17 @@ class NukeProjectSettingsHandler:
         Returns the preset dict (never None).
         """
         pipeline_key = None
-        project = context.project
-        if project:
-            try:
-                sg = self.app.shotgun
-                result = sg.find_one(
-                    "Project", [["id", "is", project["id"]]], ["sg_color_pipeline"]
-                )
-                if result and result.get("sg_color_pipeline"):
-                    pipeline_key = result["sg_color_pipeline"]
-            except Exception:
-                logger.warning(
-                    "tk-nuke-projectsettings: live sg_color_pipeline query "
-                    "failed, falling back to NFA_COLOR_PIPELINE env var",
-                    exc_info=True,
-                )
+        try:
+            if settings is None:
+                settings = self._resolve_settings(context)
+            if "sg_color_pipeline" in settings:
+                pipeline_key = settings["sg_color_pipeline"][0]
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: live sg_color_pipeline query "
+                "failed, falling back to NFA_COLOR_PIPELINE env var",
+                exc_info=True,
+            )
 
         if not pipeline_key:
             pipeline_key = os.environ.get("NFA_COLOR_PIPELINE")
@@ -203,20 +201,25 @@ class NukeProjectSettingsHandler:
 
         return COLOR_PIPELINE_PRESETS[DEFAULT_COLOR_PIPELINE_KEY]
 
-    def _get_fps(self, context):
-        project = context.project
-        if project:
+    def _resolve_settings(self, context):
+        """Shot value > project value, one query per entity. See
+        pipeline_settings.py. Raises if ShotGrid is unreachable."""
+        entity = context.entity if context.entity and context.entity.get("type") == "Shot" else None
+        return pipeline_settings.resolve_settings(
+            self.app.shotgun, context.project, entity
+        )
+
+    def _get_fps(self, context, settings=None):
+        if context.project:
             try:
-                sg = self.app.shotgun
-                result = sg.find_one(
-                    "Project", [["id", "is", project["id"]]], ["sg_fps"]
-                )
-                if result and result.get("sg_fps") is not None:
-                    return float(result["sg_fps"])
+                if settings is None:
+                    settings = self._resolve_settings(context)
+                if "sg_frame_rate" in settings:
+                    return float(settings["sg_frame_rate"][0])
                 return None
             except Exception:
                 logger.warning(
-                    "tk-nuke-projectsettings: live sg_fps query failed, "
+                    "tk-nuke-projectsettings: live frame rate query failed, "
                     "falling back to NFA_PROJECT_FPS env var",
                     exc_info=True,
                 )
@@ -668,7 +671,9 @@ class NukeProjectSettingsHandler:
                         exc_info=True,
                     )
 
-    def _apply_format_from_plate(self, root, width, height):
+    def _apply_format_from_plate(
+        self, root, width, height, source="ingested plate EXR metadata"
+    ):
         """
         Sets the Nuke script's project/full-size format (root()["format"])
         to a format matching the given width/height, registering a new
@@ -707,10 +712,11 @@ class NukeProjectSettingsHandler:
                 root["format"].setValue(format_name)
                 logger.info(
                     "tk-nuke-projectsettings: set project format to %s "
-                    "(%dx%d, from ingested plate EXR metadata)",
+                    "(%dx%d, from %s)",
                     format_name,
                     width,
                     height,
+                    source,
                 )
         except Exception:
             logger.warning(
@@ -884,20 +890,29 @@ class NukeProjectSettingsHandler:
 
         # --- Resolve this project's color pipeline once, used for both
         # the OCIO config below and the plate Read node's colorspace ---
-        color_pipeline = self._get_color_pipeline(context)
+        try:
+            settings = self._resolve_settings(context)
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: could not resolve settings from "
+                "ShotGrid, using per-setting fallbacks",
+                exc_info=True,
+            )
+            settings = None
+        color_pipeline = self._get_color_pipeline(context, settings)
 
         # --- Color management: per-project OCIO config ---
         self._apply_ocio(root, color_pipeline["ocio_config"])
 
         # --- FPS ---
-        fps = self._get_fps(context)
+        fps = self._get_fps(context, settings)
         if fps is not None:
             if root["fps"].value() != fps:
                 root["fps"].setValue(fps)
                 logger.info("tk-nuke-projectsettings: set fps to %s", fps)
         else:
             logger.info(
-                "tk-nuke-projectsettings: no sg_fps found, leaving fps untouched"
+                "tk-nuke-projectsettings: no frame rate set on shot or project, leaving fps untouched"
             )
 
         # --- Plate lookup (used for both the Read node and, if needed,
@@ -957,7 +972,18 @@ class NukeProjectSettingsHandler:
         # from sg_cut_in/sg_cut_out instead of the disk scan and are not
         # guaranteed to be a frame that actually exists in this
         # particular plate sequence. ---
-        if printf_path and disk_first is not None:
+        # An explicit format on the shot or project (set in the project
+        # creator / on the Shot) wins. Only when none is set do we fall
+        # back to deriving it from the plate.
+        explicit_format = (
+            pipeline_settings.resolved_format(settings) if settings else None
+        )
+        if explicit_format:
+            width, height, source = explicit_format
+            self._apply_format_from_plate(
+                root, width, height, source="%s setting" % source
+            )
+        elif printf_path and disk_first is not None:
             width, height = self._read_exr_dimensions(
                 printf_path, disk_first, disk_last
             )

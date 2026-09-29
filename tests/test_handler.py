@@ -618,3 +618,134 @@ class TestPlateRootDirResolution:
         handler, context, _ = _setup_handler(hm)
         handler.app.sgtk.templates.pop("shot_plate")
         assert handler._find_plate_root_dir(context) is None
+
+
+# --------------------------------------------------------------------------
+# Tests: per-shot overrides of project defaults (pipeline_settings)
+# --------------------------------------------------------------------------
+
+class FieldAwareShotgun(FakeShotgun):
+    """Returns only the requested fields and, like real ShotGrid, raises when
+    asked for a field that does not exist on the entity type."""
+
+    def __init__(self, project_row, shot_row, missing_fields=()):
+        super().__init__(project_row=project_row, shot_row=shot_row)
+        self.missing_fields = set(missing_fields)
+
+    def find_one(self, entity_type, filters, fields):
+        bad = self.missing_fields.intersection(fields)
+        if bad:
+            raise RuntimeError("Field(s) not found: %s" % sorted(bad))
+        row = super().find_one(entity_type, filters, fields)
+        return {k: v for k, v in row.items() if k in fields}
+
+
+def _handler_with(hm, project_row, shot_row, **kw):
+    handler, context, _ = _setup_handler(hm, project_row=project_row, shot_row=shot_row)
+    handler.app.shotgun = FieldAwareShotgun(project_row, shot_row, **kw)
+    return handler, context
+
+
+class TestShotOverridesProject:
+    def test_shot_value_wins_over_project(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module,
+            {"sg_frame_rate": 24.0, "sg_color_pipeline": "aces_acescg"},
+            {"sg_frame_rate": 23.976},
+        )
+        assert handler._get_fps(ctx) == pytest.approx(23.976)
+
+    def test_empty_shot_inherits_project(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module,
+            {"sg_frame_rate": 24.0},
+            {"sg_frame_rate": None},
+        )
+        assert handler._get_fps(ctx) == 24.0
+
+    def test_zero_on_shot_means_unset(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module, {"sg_frame_rate": 25.0}, {"sg_frame_rate": 0}
+        )
+        assert handler._get_fps(ctx) == 25.0
+
+    def test_float_fps_preserved(self, handler_module):
+        handler, ctx = _handler_with(handler_module, {"sg_frame_rate": 29.97}, {})
+        assert handler._get_fps(ctx) == pytest.approx(29.97)
+
+    def test_legacy_integer_sg_fps_still_used(self, handler_module):
+        handler, ctx = _handler_with(handler_module, {"sg_fps": 25}, {})
+        assert handler._get_fps(ctx) == 25.0
+
+    def test_new_frame_rate_beats_legacy_sg_fps(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module, {"sg_fps": 24, "sg_frame_rate": 23.976}, {}
+        )
+        assert handler._get_fps(ctx) == pytest.approx(23.976)
+
+    def test_shot_color_pipeline_override(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module,
+            {"sg_color_pipeline": "aces_acescg"},
+            {"sg_color_pipeline": "rec709_sdr"},
+        )
+        preset = handler._get_color_pipeline(ctx)
+        assert preset is handler_module["handler_mod"].COLOR_PIPELINE_PRESETS["rec709_sdr"]
+
+    def test_unset_everywhere_gives_default_pipeline_and_no_fps(self, handler_module):
+        handler, ctx = _handler_with(handler_module, {}, {})
+        assert handler._get_fps(ctx) is None
+        default = handler_module["handler_mod"].DEFAULT_COLOR_PIPELINE_KEY
+        assert handler._get_color_pipeline(ctx) is (
+            handler_module["handler_mod"].COLOR_PIPELINE_PRESETS[default]
+        )
+
+    def test_site_without_new_fields_degrades_to_legacy(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module,
+            {"sg_fps": 25, "sg_color_pipeline": "rec709_sdr"},
+            {},
+            missing_fields=("sg_frame_rate", "sg_format_width", "sg_format_height"),
+        )
+        assert handler._get_fps(ctx) == 25.0
+        preset = handler._get_color_pipeline(ctx)
+        assert preset is handler_module["handler_mod"].COLOR_PIPELINE_PRESETS["rec709_sdr"]
+
+
+class TestExplicitFormat:
+    def test_resolved_format_prefers_shot(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module,
+            {"sg_format_width": 1920, "sg_format_height": 1080},
+            {"sg_format_width": 4096, "sg_format_height": 2160},
+        )
+        s = handler._resolve_settings(ctx)
+        from tk_nuke_projectsettings import pipeline_settings as ps
+        assert ps.resolved_format(s) == (4096, 2160, "shot")
+
+    def test_resolved_format_from_project(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module, {"sg_format_width": 3840, "sg_format_height": 2160}, {}
+        )
+        from tk_nuke_projectsettings import pipeline_settings as ps
+        assert ps.resolved_format(handler._resolve_settings(ctx)) == (3840, 2160, "project")
+
+    def test_half_a_format_is_ignored(self, handler_module):
+        handler, ctx = _handler_with(handler_module, {"sg_format_width": 1920}, {})
+        from tk_nuke_projectsettings import pipeline_settings as ps
+        assert ps.resolved_format(handler._resolve_settings(ctx)) is None
+
+    def test_apply_settings_uses_explicit_format_over_plate(self, handler_module):
+        hm = handler_module
+        shot = "STRM_E2_0010"
+        paths = _write_fake_exr_sequence(hm["plate_dir"], shot, 1001, 1005)
+        hm["fake_disk"][paths[0].replace(os.sep, "/")] = (4448, 3096)  # plate size
+
+        handler, ctx = _handler_with(
+            hm,
+            {"sg_format_width": 1920, "sg_format_height": 1080},
+            {"sg_cut_in": 1001, "sg_cut_out": 1005},
+        )
+        handler.apply_settings()
+        fmt = hm["fake_nuke"].root()["format"].value()
+        assert (fmt.width(), fmt.height()) == (1920, 1080)
