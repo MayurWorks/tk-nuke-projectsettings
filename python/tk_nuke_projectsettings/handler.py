@@ -76,7 +76,7 @@ COLOR_PIPELINE_PRESETS = {
         "plate_read_colorspace": "ACES - ACES2065-1",
     },
     "rec709_sdr": {
-        "ocio_config": "nuke_default",
+        "ocio_config": "nuke-default",
         "working_colorspace": "linear",
         "plate_read_colorspace": "sRGB",
     },
@@ -548,6 +548,32 @@ class NukeProjectSettingsHandler:
 
         return printf_path, first_frame, last_frame
 
+    @staticmethod
+    def _match_ocio_config_name(root, wanted):
+        """
+        Returns the exact dropdown entry of root["OCIO_config"] that matches
+        `wanted`, ignoring case and the _/- difference ("nuke_default" vs
+        Nuke's "nuke-default"). Entries can carry tab-separated extras
+        ("aces_1.2\tACES/aces_1.2..."); only the first field is the name.
+        Returns `wanted` unchanged if the knob has no values() or nothing
+        matches, so the caller's setValue error handling still applies.
+        """
+        try:
+            options = [v.split("\t")[0] for v in root["OCIO_config"].values()]
+        except Exception:
+            return wanted
+
+        def norm(name):
+            return name.lower().replace("_", "-")
+
+        for option in options:
+            if option == wanted:
+                return option
+        for option in options:
+            if norm(option) == norm(wanted):
+                return option
+        return wanted
+
     def _apply_ocio(self, root, ocio_config_name):
         """
         Sets Nuke's built-in OCIO config via Project Settings knobs, per
@@ -560,6 +586,7 @@ class NukeProjectSettingsHandler:
         try:
             if root["colorManagement"].value() != OCIO_COLOR_MANAGEMENT:
                 root["colorManagement"].setValue(OCIO_COLOR_MANAGEMENT)
+            ocio_config_name = self._match_ocio_config_name(root, ocio_config_name)
             if root["OCIO_config"].value() != ocio_config_name:
                 root["OCIO_config"].setValue(ocio_config_name)
             logger.info(

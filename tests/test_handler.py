@@ -749,3 +749,39 @@ class TestExplicitFormat:
         handler.apply_settings()
         fmt = hm["fake_nuke"].root()["format"].value()
         assert (fmt.width(), fmt.height()) == (1920, 1080)
+
+
+class TestOcioConfigNameMatching:
+    def _root(self, options, current="aces_1.2"):
+        class Knob:
+            def __init__(self, value, values=None):
+                self._v, self._values = value, values
+            def value(self): return self._v
+            def setValue(self, v):
+                if self._values is not None and v not in [o.split("\t")[0] for o in self._values]:
+                    raise ValueError(v)
+                self._v = v
+            def values(self): return self._values
+        return {
+            "colorManagement": Knob("OCIO"),
+            "OCIO_config": Knob(current, options),
+        }
+
+    OPTIONS = ["aces_1.2\tACES/aces_1.2\t\t", "fn-nuke_cg-config-v1.0.0_aces-v1.3_ocio-v2.1\tACES/x\t\ty", "nuke-default", "custom"]
+
+    def test_underscore_name_matches_hyphenated_dropdown_entry(self, handler_module):
+        handler, _ctx, _ = _setup_handler(handler_module)
+        root = self._root(self.OPTIONS)
+        handler._apply_ocio(root, "nuke_default")
+        assert root["OCIO_config"].value() == "nuke-default"
+
+    def test_tab_suffixed_entry_matches_plain_name(self, handler_module):
+        handler, _ctx, _ = _setup_handler(handler_module)
+        root = self._root(self.OPTIONS, current="nuke-default")
+        handler._apply_ocio(root, "aces_1.2")
+        assert root["OCIO_config"].value() == "aces_1.2"
+
+    def test_rec709_preset_uses_a_name_nuke_actually_lists(self, handler_module):
+        hm = handler_module["handler_mod"]
+        name = hm.COLOR_PIPELINE_PRESETS["rec709_sdr"]["ocio_config"]
+        assert name in [o.split("\t")[0] for o in self.OPTIONS]
