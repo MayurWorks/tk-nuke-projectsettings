@@ -58,3 +58,32 @@ class NukeProjectSettings(Application):
 
         # Remove any callbacks that were registered by the handler
         self.handler.remove_callbacks()
+
+    def get_pipeline_settings(self, context):
+        """
+        Public API for other apps/hooks: resolves the same Shot > Project
+        pipeline settings (sg_frame_rate, sg_format_width, sg_format_height,
+        sg_color_pipeline) this app applies to nuke.root() on launch - see
+        pipeline_settings.py for the precedence rules and the legacy sg_fps
+        fallback.
+
+        Added so a hook that only knows the context (for example a publish2
+        validation plugin, which has no reason to duplicate this app's
+        ShotGrid queries or its Shot > Project logic) can ask "what should
+        this shot's settings be right now" and get the same answer this app
+        itself would use.
+
+        Returns {field: (value, source)}, source being "shot" or "project" -
+        same shape as pipeline_settings.resolve_settings(). Never raises: on
+        any failure (ShotGrid unreachable, fields not on this site) returns
+        {} rather than surfacing an exception to a caller that may not be
+        expecting one.
+        """
+        try:
+            return self.handler._resolve_settings(context)
+        except Exception:
+            self.log_warning(
+                "get_pipeline_settings: could not resolve settings for %s"
+                % context
+            )
+            return {}
