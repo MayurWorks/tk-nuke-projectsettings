@@ -785,3 +785,33 @@ class TestOcioConfigNameMatching:
         hm = handler_module["handler_mod"]
         name = hm.COLOR_PIPELINE_PRESETS["rec709_sdr"]["ocio_config"]
         assert name in [o.split("\t")[0] for o in self.OPTIONS]
+
+
+class TestExpectedScriptSettings:
+    def test_collects_fps_range_format_and_color(self, handler_module):
+        handler, ctx = _handler_with(
+            handler_module,
+            {"sg_frame_rate": 24.0, "sg_color_pipeline": "aces_acescg"},
+            {"sg_format_width": 2048, "sg_format_height": 858,
+             "sg_cut_in": 1001, "sg_cut_out": 1085},
+        )
+        exp = handler.expected_script_settings(ctx)
+        assert (exp["first_frame"], exp["last_frame"]) == (1001, 1085)
+        assert exp["fps"] == 24.0
+        assert (exp["width"], exp["height"]) == (2048, 858)
+        assert exp["ocio_config"] == "aces_1.2"
+        assert exp["working_colorspace"] == "ACES - ACEScg"
+
+    def test_format_absent_when_not_explicit(self, handler_module):
+        handler, ctx = _handler_with(handler_module, {"sg_frame_rate": 25.0}, {})
+        exp = handler.expected_script_settings(ctx)
+        assert "width" not in exp and "height" not in exp
+
+    def test_never_raises_when_shotgun_is_down(self, handler_module):
+        handler, ctx = _handler_with(handler_module, {}, {})
+
+        def boom(*a, **k):
+            raise RuntimeError("offline")
+        handler.app.shotgun.find_one = boom
+        exp = handler.expected_script_settings(ctx)
+        assert exp["ocio_config"]  # default pipeline still resolves

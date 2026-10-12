@@ -87,3 +87,19 @@ class NukeProjectSettings(Application):
                 % context
             )
             return {}
+
+    def get_expected_script_settings(self, context):
+        """
+        Public API for publish hooks: the nuke.root() values this app would
+        apply for ``context`` (fps, cut range, explicit format, OCIO config and
+        working colorspace) so a validator can compare the live script against
+        them without duplicating the Shot > Project resolution. Returns {} on
+        any failure.
+        """
+        try:
+            return self.handler.expected_script_settings(context)
+        except Exception:
+            self.log_warning(
+                "get_expected_script_settings: could not resolve for %s" % context
+            )
+            return {}

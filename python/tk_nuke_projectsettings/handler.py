@@ -280,6 +280,42 @@ class NukeProjectSettingsHandler:
                 )
         return None, None
 
+    def expected_script_settings(self, context):
+        """
+        What nuke.root() should look like for ``context``, as plain values for
+        validation: {fps, first_frame, last_frame, width, height, ocio_config,
+        working_colorspace}. A key is present only when the pipeline has a
+        value for it (width/height only when the shot or project sets an
+        explicit format; otherwise the format follows the plate and is not
+        checked). Never raises; returns {} when nothing can be resolved.
+        """
+        expected = {}
+        try:
+            settings = self._resolve_settings(context)
+        except Exception:
+            logger.warning(
+                "tk-nuke-projectsettings: expected_script_settings could not "
+                "resolve settings", exc_info=True)
+            settings = {}
+
+        fps = self._get_fps(context, settings=settings)
+        if fps:
+            expected["fps"] = fps
+
+        first, last = self._get_frame_range(context)
+        if first is not None and last is not None:
+            expected["first_frame"] = first
+            expected["last_frame"] = last
+
+        fmt = pipeline_settings.resolved_format(settings)
+        if fmt:
+            expected["width"], expected["height"] = fmt[0], fmt[1]
+
+        preset = self._get_color_pipeline(context, settings=settings)
+        expected["ocio_config"] = preset["ocio_config"]
+        expected["working_colorspace"] = preset["working_colorspace"]
+        return expected
+
     def _find_latest_plate_publish(self, context):
         """
         Looks up the most recent PublishedFile for this Shot matching the
