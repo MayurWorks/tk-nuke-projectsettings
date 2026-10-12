@@ -96,7 +96,11 @@ COLOR_PIPELINE_PRESETS = {
 # NOT require a PublishedFile to exist) is what actually finds the
 # plate. See _resolve_plate_sequence_path's docstring for the disk-scan
 # path.
-PLATE_PUBLISH_TYPES = ["Hiero Plate"]
+# "Plate" is what tk-hiero-export's copy exporter registers for the EXR
+# sequence (exr_plate_published_file_type); "Hiero Plate" is kept so shots
+# published before that change keep resolving. The .exr-only filter in
+# _find_latest_plate_publish() still guards against the reference .mov.
+PLATE_PUBLISH_TYPES = ["Plate", "Hiero Plate"]
 
 # Name of a hidden root() user knob used purely as an in-session marker
 # (never saved meaningfully, just present on the Root object) recording
