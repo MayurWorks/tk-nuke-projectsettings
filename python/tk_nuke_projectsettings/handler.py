@@ -284,7 +284,7 @@ class NukeProjectSettingsHandler:
         """
         What nuke.root() should look like for ``context``, as plain values for
         validation: {fps, first_frame, last_frame, width, height, ocio_config,
-        working_colorspace}. A key is present only when the pipeline has a
+        working_colorspace, plate_read_colorspace}. A key is present only when the pipeline has a
         value for it (width/height only when the shot or project sets an
         explicit format; otherwise the format follows the plate and is not
         checked). Never raises; returns {} when nothing can be resolved.
@@ -314,6 +314,7 @@ class NukeProjectSettingsHandler:
         preset = self._get_color_pipeline(context, settings=settings)
         expected["ocio_config"] = preset["ocio_config"]
         expected["working_colorspace"] = preset["working_colorspace"]
+        expected["plate_read_colorspace"] = preset["plate_read_colorspace"]
         return expected
 
     def _find_latest_plate_publish(self, context):

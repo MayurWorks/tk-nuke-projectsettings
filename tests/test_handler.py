@@ -801,6 +801,7 @@ class TestExpectedScriptSettings:
         assert (exp["width"], exp["height"]) == (2048, 858)
         assert exp["ocio_config"] == "aces_1.2"
         assert exp["working_colorspace"] == "ACES - ACEScg"
+        assert exp["plate_read_colorspace"] == "ACES - ACEScg"
 
     def test_format_absent_when_not_explicit(self, handler_module):
         handler, ctx = _handler_with(handler_module, {"sg_frame_rate": 25.0}, {})
