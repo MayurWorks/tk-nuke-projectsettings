@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # Nuke 16 ships Python 3.11
+      - name: Install
+        run: pip install pytest pyyaml ruff
+      - name: Lint (syntax errors and undefined names only)
+        run: ruff check --select E9,F63,F7,F82 .
+      - name: Tests
+        run: |
+          if [ -d tests ]; then
+            python -m pytest -q tests
+          else
+            echo "no tests directory"
+          fi
